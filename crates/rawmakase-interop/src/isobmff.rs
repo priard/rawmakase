@@ -172,6 +172,9 @@ pub struct Heif {
     associations: Vec<Association>,
     /// (kind, from, to).
     references: Vec<([u8; 4], u32, u32)>,
+    /// The body of `meta`'s `idat` box, which holds the data of items stored
+    /// by construction method 1.
+    idat: Vec<u8>,
 }
 
 /// A big-endian cursor over a box body; every read is bounds-checked.
@@ -264,6 +267,7 @@ impl Heif {
                 b"iloc" => heif.locations = locations(b)?,
                 b"iprp" => heif.read_properties(b)?,
                 b"iref" => heif.references = references(b)?,
+                b"idat" => heif.idat = body.to_vec(),
                 _ => {}
             }
         }
@@ -312,9 +316,10 @@ impl Heif {
         }
     }
 
-    /// Item `id`'s data from the file, its extents joined; up to 256 MiB, and
-    /// `None` when an extent runs past the file. Construction method 1 (`idat`)
-    /// and length 0 ("to the end of the file") are not read.
+    /// Item `id`'s data from the file, or from the `idat` box (construction
+    /// method 1), its extents joined; up to 256 MiB, and `None` when an extent
+    /// runs past where it is stored. Length 0 ("to the end of the file") is
+    /// not read.
     pub fn data<R: Read + Seek>(&self, r: &mut R, id: u32) -> Option<Vec<u8>> {
         self.data_up_to(r, id, MAX_ITEM)
     }
@@ -326,19 +331,29 @@ impl Heif {
         let l = self
             .locations
             .iter()
-            .find(|l| l.id == id && l.method == 0)?;
-        let file_len = file_len(r)?;
+            .find(|l| l.id == id && l.method <= 1)?;
+        let in_idat = l.method == 1;
+        let source_len = if in_idat {
+            self.idat.len() as u64
+        } else {
+            file_len(r)?
+        };
         let mut total = 0u64;
         for (offset, len) in &l.extents {
             let end = l.base.checked_add(*offset)?.checked_add(*len)?;
             total = total.checked_add(*len)?;
-            if end > file_len || total > max.min(MAX_ITEM) {
+            if end > source_len || total > max.min(MAX_ITEM) {
                 return None;
             }
         }
         let mut data = Vec::with_capacity(usize::try_from(total).ok()?);
         for (offset, len) in &l.extents {
-            r.seek(SeekFrom::Start(l.base + offset)).ok()?;
+            let start = l.base + offset;
+            if in_idat {
+                data.extend_from_slice(&self.idat[start as usize..(start + len) as usize]);
+                continue;
+            }
+            r.seek(SeekFrom::Start(start)).ok()?;
             let at = data.len();
             data.resize(at + usize::try_from(*len).ok()?, 0);
             r.read_exact(&mut data[at..]).ok()?;
@@ -773,6 +788,25 @@ mod tests {
         let heif = Heif::read(&mut Cursor::new(&file)).unwrap();
         assert_eq!(heif.properties(1), [&Property::Size(1, 2)]);
         assert_eq!(heif.properties(2), [&Property::Rotation(1)]);
+    }
+
+    #[test]
+    fn item_data_in_the_idat_box_is_read() {
+        // iloc version 1: item 1 by construction method 1, extents (0, 3) and
+        // (5, 2) of the idat box's body; item 2 runs past it.
+        let mut iloc = vec![1, 0, 0, 0, 0x44, 0x00, 0, 2];
+        iloc.extend([0, 1, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3]);
+        iloc.extend([0, 0, 0, 5, 0, 0, 0, 2]);
+        iloc.extend([0, 2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0, 3]);
+        let meta = [vec![0; 4], bx(b"iloc", &iloc), bx(b"idat", b"abcdefgh")].concat();
+        let file = [bx(b"ftyp", b"avif\0\0\0\0avif"), bx(b"meta", &meta)].concat();
+        let heif = Heif::read(&mut Cursor::new(&file)).unwrap();
+        assert_eq!(
+            heif.data(&mut Cursor::new(&file), 1).as_deref(),
+            Some(&b"abcfg"[..])
+        );
+        assert_eq!(heif.data_up_to(&mut Cursor::new(&file), 1, 4), None);
+        assert_eq!(heif.data(&mut Cursor::new(&file), 2), None);
     }
 
     #[test]
